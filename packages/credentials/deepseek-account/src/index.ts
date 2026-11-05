@@ -10,7 +10,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import { installAccountTaskCancellation, isRunningAccountTask } from './account-tasks.ts'
 import { mergePlatformCookies, platformClientHeaders, platformWireLocale } from './client-metadata.ts'
-import { type AccountNotification, type AccountNotificationBatch, type AccountNotificationEvent, type AccountNotificationId, type AccountClientMetadata, type AccountDetails, type AccountUserId, type AccountView, type AccountUpdate, type PlatformSession, type SignInAttemptId, type SignInAttemptView } from './types.ts'
+import { type AccountNotification, type AccountNotificationBatch, type AccountNotificationEvent, type AccountNotificationId, type AccountClientMetadata, type AccountDetails, type AccountProfile, type AccountUserId, type AccountView, type AccountUpdate, type PlatformSession, type SignInAttemptId, type SignInAttemptView } from './types.ts'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import type { AuthorizationSession } from '@deepseek-ai/dsh-authorization'
 import { profile, readAccountDetail } from './details.ts'
@@ -33,8 +33,20 @@ declare module '@deepseek-ai/cordis' {
 
 const KEY = credentialKey('deepseek-account-platform', 'default')
 const DEVICE = credentialKey('deepseek-account-platform', 'device')
+const PROFILE_CACHE = credentialKey('deepseek-account-platform', 'profile-cache')
 const grant = z.object({ version: z.literal(1), token: z.string().min(1), issuer: z.url() })
 const device = z.object({ id: z.uuid() })
+type ReadyProfile = Extract<AccountDetails['profile'], { status: 'ready' }>
+const cachedProfile = z.object({
+  version: z.literal(1),
+  token: z.string().min(1),
+  profile: z.object({
+    id: z.string().nullable(),
+    avatarUrl: z.string().nullable().optional(),
+    name: z.string().nullable(),
+    contact: z.string().nullable(),
+  }),
+})
 
 /** Deployment-specific platform and request deadlines. */
 export interface Config {
@@ -194,8 +206,13 @@ export class DeepSeekAccount extends TypertRemoteService {
     if (record.kind !== 'grant') throw new PlatformAuthError('storage')
     const parsed = grant.safeParse(record.payload)
     if (!parsed.success) throw new PlatformAuthError('storage')
-    if (parsed.data.issuer === this.origin) return
+    if (parsed.data.issuer === this.origin) {
+      const cached = await this.readCachedProfile(parsed.data.token)
+      if (cached !== undefined) this.lastProfile = { token: parsed.data.token, profile: cached }
+      return
+    }
     await this.ctx.credentials.deleteRecord(KEY)
+    await this.ctx.credentials.deleteRecord(PROFILE_CACHE)
   }
 
   /**
@@ -232,9 +249,15 @@ export class DeepSeekAccount extends TypertRemoteService {
     const result = await this.getDetail('profile', this.detailHeaders(client), { lifetime, stored })
     if (this.detailsLifetime !== lifetime) return null
     if (result !== null) this.cacheProfile(stored.token, result)
-    if (result?.status !== 'failed') return result
-    // Only this same grant's last ready read may stand in for a failed refresh.
-    const cached = this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined
+    if (result?.status !== 'failed') {
+      if (result?.status === 'ready') await this.writeCachedProfile(stored.token, result)
+      return result
+    }
+    // Only this same grant's last ready read may stand in for a failed refresh. The store
+    // survives a Host restart, where the in-memory copy is gone but the grant is still valid.
+    const persisted = await this.readCachedProfile(stored.token)
+    if (persisted !== undefined) this.cacheProfile(stored.token, persisted)
+    const cached = persisted ?? (this.lastProfile?.token === stored.token ? this.lastProfile.profile : undefined)
     return cached ?? result
   }
 
@@ -343,6 +366,32 @@ export class DeepSeekAccount extends TypertRemoteService {
     if (previous !== (profile.value.id || null)) this.changed('identity')
   }
 
+  /** Persist the last ready profile so a transient profile endpoint failure cannot blank the account UI. */
+  private async writeCachedProfile(token: string, profile: ReadyProfile): Promise<void> {
+    try {
+      await this.ctx.credentials.modifyRecord(PROFILE_CACHE, () => Promise.resolve({
+        kind: 'grant',
+        payload: { version: 1, token, profile: profile.value },
+      }))
+    } catch {
+      // The live profile is still usable; a failed cache write must not fail the account query.
+    }
+  }
+
+  /** Read the persisted profile only for the grant it was written with. */
+  private async readCachedProfile(token: string): Promise<ReadyProfile | undefined> {
+    try {
+      const record = await this.ctx.credentials.readRecord(PROFILE_CACHE)
+      if (record === undefined || record.kind !== 'grant') return undefined
+      const parsed = cachedProfile.safeParse(record.payload)
+      return parsed.success && parsed.data.token === token
+        ? { status: 'ready', value: parsed.data.profile as AccountProfile }
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   private async getDetail<K extends keyof AccountDetails>(field: K, headers: Record<string, string>,
     captured?: { lifetime: AbortController; stored: z.infer<typeof grant> }): Promise<AccountDetails[K] | null> {
     const lifetime = captured?.lifetime ?? this.detailsLifetime
@@ -389,6 +438,7 @@ export class DeepSeekAccount extends TypertRemoteService {
       const current = grant.parse(record.payload)
       if (current.token !== token || current.issuer !== this.origin) return this.getState()
       await this.ctx.credentials.deleteRecord(KEY)
+      await this.ctx.credentials.deleteRecord(PROFILE_CACHE)
       this.ctx.emit('deepseek-account/session-expired')
       this.attempt = undefined
       this.ctx.emit('deepseek-account/signed-out')
@@ -562,6 +612,7 @@ export class DeepSeekAccount extends TypertRemoteService {
         await this.ctx.credentials.deleteRecord(KEY)
         this.revoke(parsed.data.token, platformClientHeaders(this.platform, client))
       }
+      await this.ctx.credentials.deleteRecord(PROFILE_CACHE)
       this.attempt = undefined
       this.ctx.emit('deepseek-account/signed-out')
       this.changed('snapshot')

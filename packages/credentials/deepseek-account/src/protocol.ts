@@ -201,7 +201,9 @@ async function platformRequest(url: string, init: RequestInit, signal: AbortSign
     await response.body?.cancel()
     throw new AccountUnauthorizedError()
   }
-  if (!response.ok || response.body === null) {
+  // CloudFront answers a blocked account request with 202 and an empty body. JSON decoding
+  // cannot succeed, and treating it as a protocol error hides a plain network failure.
+  if (response.status === 202 || !response.ok || response.body === null) {
     if (!callerCancelled(signal)) console.error('[deepseek-account] request failed', { path, status: response.status, errorCode: 'network' })
     await response.body?.cancel()
     throw new PlatformAuthError('network')

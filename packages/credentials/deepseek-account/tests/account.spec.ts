@@ -985,6 +985,39 @@ it('retains successful profile data on current failure only for the same credent
   expect(await f.account.getProfile(clientMetadata())).toBeNull()
 })
 
+it('persists a ready profile and falls back to it when the refresh fails', async () => {
+  const f = await fixture()
+  await storeAccount(f)
+  const initial = await f.account.getProfile(clientMetadata())
+  expect(initial).toMatchObject({ status: 'ready', value: { name: 'Test Account', contact: '138****5678' } })
+
+  const record = await f.ctx.credentials.readRecord(credentialKey('deepseek-account-platform', 'profile-cache'))
+  expect(record).toMatchObject({
+    kind: 'grant',
+    payload: {
+      version: 1, token: 'test-platform-grant',
+      profile: { id: 'test-user', name: 'Test Account', avatarUrl: null, contact: '138****5678' },
+    },
+  })
+  expect(JSON.stringify(record)).not.toContain('never-copy-response-token')
+
+  // A restart discards the in-memory copy; the persisted profile must still serve the account card.
+  delete (f.account as unknown as { lastProfile?: unknown }).lastProfile
+  f.failProfile(true)
+  expect(await f.account.getProfile(clientMetadata())).toEqual(initial)
+
+  await f.account.signOut(clientMetadata())
+  expect(await f.ctx.credentials.readRecord(credentialKey('deepseek-account-platform', 'profile-cache'))).toBeUndefined()
+})
+
+it('treats a 202 empty profile response as a transient failure', async () => {
+  const f = await fixture()
+  await storeAccount(f)
+  const initial = await f.account.getProfile(clientMetadata())
+  f.detailStatus(202)
+  expect(await f.account.getProfile(clientMetadata())).toEqual(initial)
+})
+
 it.each([[], [{ currency: 'CNY', balance: '0.00' }]].map(wallets => ({ wallets })))('preserves empty or zero bonus wallets', async ({ wallets }) => {
   const f = await fixture()
   await storeAccount(f)
